@@ -1,0 +1,65 @@
+{
+  "name": "local-harness-agent",
+  "displayName": "Local Harness Agent",
+  "description": "A local, Ollama-backed coding agent exposed as a VS Code chat participant (@localagent).",
+  "version": "0.0.5",
+  "publisher": "mahesha-madhushanka",
+  "engines": {
+    "vscode": "^1.95.0"
+  },
+  "categories": [
+    "Chat",
+    "AI",
+    "Other"
+  ],
+  "activationEvents": [],
+  "main": "./out/extension.js",
+  "contributes": {
+    "chatParticipants": [
+      {
+        "id": "local-harness.agent",
+        "name": "localagent",
+        "fullName": "Local Agent",
+        "description": "Ask your local Ollama model to inspect or edit files in this workspace",
+        "isSticky": true
+      }
+    ],
+    "configuration": {
+      "title": "Local Harness Agent",
+      "properties": {
+        "localAgent.model": {
+          "type": "string",
+          "default": "qwen2.5:7b",
+          "description": "Ollama model name to use. Must already be pulled with `ollama pull <name>`."
+        },
+        "localAgent.baseUrl": {
+          "type": "string",
+          "default": "http://localhost:11434/v1/chat/completions",
+          "description": "Ollama's OpenAI-compatible chat completions endpoint."
+        },
+        "localAgent.maxTurns": {
+          "type": "number",
+          "default": 10,
+          "description": "Max tool-calling round-trips per message before the agent stops itself."
+        },
+        "localAgent.streaming": {
+          "type": "boolean",
+          "default": false,
+          "description": "Stream partial responses as they arrive. Some Ollama/model combinations drop tool_calls when streaming, causing the agent to describe edits instead of making them — disable this if the agent stops calling write_file."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "package": "vsce package --allow-missing-repository"
+  },
+  "devDependencies": {
+    "@types/node": "^20.19.43",
+    "@types/vscode": "^1.95.0",
+    "@vscode/vsce": "^3.0.0",
+    "typescript": "^5.4.0"
+  }
+}
