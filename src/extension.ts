@@ -42,11 +42,41 @@ const TOOLS = [
     function: {
       name: 'write_file',
       description:
-        'Create or overwrite a workspace-relative file with new contents. Requires user approval.',
+        'Create a brand-new workspace-relative file. Fails if the file already exists unless ' +
+        'overwrite is set to true. For any change to an EXISTING file, use edit_file instead — ' +
+        'do not use write_file to modify a file that already exists.',
       parameters: {
         type: 'object',
-        properties: { path: { type: 'string' }, content: { type: 'string' } },
+        properties: {
+          path: { type: 'string' },
+          content: { type: 'string' },
+          overwrite: {
+            type: 'boolean',
+            description: 'Set true only if you intend a full, deliberate replacement of an existing file.',
+          },
+        },
         required: ['path', 'content'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'edit_file',
+      description:
+        'Make a targeted edit to an existing workspace-relative file by replacing one exact, unique ' +
+        'occurrence of old_string with new_string. This is the preferred way to change an existing ' +
+        'file — you only need to include the lines that change, not the whole file. old_string must ' +
+        "match the file's current exact text (use read_file first if unsure) and must be unique in " +
+        'the file; include enough surrounding lines to make it unique if it is not.',
+      parameters: {
+        type: 'object',
+        properties: {
+          path: { type: 'string' },
+          old_string: { type: 'string' },
+          new_string: { type: 'string' },
+        },
+        required: ['path', 'old_string', 'new_string'],
       },
     },
   },
@@ -80,11 +110,11 @@ const TOOLS = [
  * Non-streaming call to Ollama's OpenAI-compatible endpoint. More verbose in the UI than
  * streaming, but some models/Ollama versions only return tool_calls reliably when stream:false.
  */
-async function callOllama(baseUrl: string, model: string, messages: OllamaMessage[]): Promise<OllamaMessage & { tool_calls?: any[] }> {
+async function callOllama(baseUrl: string, model: string, messages: OllamaMessage[], numCtx: number): Promise<OllamaMessage & { tool_calls?: any[] }> {
   const res = await fetch(baseUrl, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ model, messages, tools: TOOLS, stream: false }),
+    body: JSON.stringify({ model, messages, tools: TOOLS, stream: false, options: { num_ctx: numCtx } }),
   });
 
   if (!res.ok) {
@@ -100,13 +130,14 @@ async function callOllamaStream(
   baseUrl: string,
   model: string,
   messages: OllamaMessage[],
+  numCtx: number,
   onDelta: (text: string) => void,
   signal: AbortSignal
 ): Promise<OllamaMessage & { tool_calls?: any[] }> {
   const res = await fetch(baseUrl, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ model, messages, tools: TOOLS, stream: true }),
+    body: JSON.stringify({ model, messages, tools: TOOLS, stream: true, options: { num_ctx: numCtx } }),
     signal,
   });
 
@@ -269,28 +300,81 @@ async function listDirectoryTool(relPath: string): Promise<string> {
   return names.length ? names.join('\n') : '(empty directory)';
 }
 
-/** Gates file writes behind the same Allow/Deny approval used for shell commands. */
-async function writeFileTool(relPath: string, content: string): Promise<string> {
+/**
+ * Gates file writes behind the same Allow/Deny approval used for shell commands.
+ * Refuses to touch an existing file unless overwrite:true was explicitly passed — this is what
+ * stops a "lazy" partial response from silently wiping a file, instead of only warning about it.
+ */
+async function writeFileTool(relPath: string, content: string, overwrite: boolean): Promise<string> {
   const uri = resolveWorkspacePath(relPath);
   let existed = true;
+  let existingContent = '';
   try {
-    await vscode.workspace.fs.stat(uri);
+    existingContent = Buffer.from(await vscode.workspace.fs.readFile(uri)).toString('utf8');
   } catch {
     existed = false;
   }
 
-  const choice = await vscode.window.showWarningMessage(
-    `Local agent wants to ${existed ? 'overwrite' : 'create'} ${relPath} (${content.length} chars).`,
-    { modal: true },
-    'Allow',
-    'Deny'
-  );
+  if (existed && !overwrite) {
+    return (
+      `Error: ${relPath} already exists. Use edit_file for a targeted change, or call write_file ` +
+      'again with overwrite: true only if you genuinely intend to replace the entire file.'
+    );
+  }
+
+  // A drastic size drop usually means the model's context got truncated and it only echoed back part of the file.
+  const looksTruncated = existed && existingContent.length > 200 && content.length < existingContent.length * 0.5;
+  const sizeNote = `${existingContent.length} -> ${content.length} chars`;
+  const warning = looksTruncated
+    ? `⚠️ Local agent wants to overwrite ${relPath} (${sizeNote}) — this looks much shorter than the original, possibly a truncated rewrite. Overwrite anyway?`
+    : `Local agent wants to ${existed ? 'overwrite' : 'create'} ${relPath} (${content.length} chars).`;
+
+  const choice = await vscode.window.showWarningMessage(warning, { modal: true }, 'Allow', 'Deny');
   if (choice !== 'Allow') {
     return 'Write blocked by user.';
   }
 
   await vscode.workspace.fs.writeFile(uri, Buffer.from(content, 'utf8'));
   return `Wrote ${content.length} chars to ${relPath}.`;
+}
+
+/**
+ * Edits an existing file by exact string replacement instead of requiring the model to
+ * reproduce the entire file. The model only needs to specify what changed, so there's no
+ * way for it to accidentally drop content it never meant to touch.
+ */
+async function editFileTool(relPath: string, oldString: string, newString: string): Promise<string> {
+  const uri = resolveWorkspacePath(relPath);
+  const original = Buffer.from(await vscode.workspace.fs.readFile(uri)).toString('utf8');
+
+  const occurrences = original.split(oldString).length - 1;
+  if (occurrences === 0) {
+    return (
+      `Error: old_string not found in ${relPath}. It must match the file's current content ` +
+      'exactly, including whitespace. Call read_file first to get the exact text.'
+    );
+  }
+  if (occurrences > 1) {
+    return (
+      `Error: old_string appears ${occurrences} times in ${relPath} — it must be unique. ` +
+      'Include more surrounding context to pinpoint a single location.'
+    );
+  }
+
+  const updated = original.replace(oldString, newString);
+
+  const choice = await vscode.window.showWarningMessage(
+    `Local agent wants to edit ${relPath} — replace ${oldString.length} chars with ${newString.length} chars.`,
+    { modal: true },
+    'Allow',
+    'Deny'
+  );
+  if (choice !== 'Allow') {
+    return 'Edit blocked by user.';
+  }
+
+  await vscode.workspace.fs.writeFile(uri, Buffer.from(updated, 'utf8'));
+  return `Edited ${relPath}: replaced ${oldString.length} chars with ${newString.length} chars.`;
 }
 
 async function searchWorkspaceTool(query: string, isRegex: boolean): Promise<string> {
@@ -320,6 +404,51 @@ async function searchWorkspaceTool(query: string, isRegex: boolean): Promise<str
   return hits.length ? hits.join('\n') : 'No matches.';
 }
 
+const TOOL_NAMES = new Set(TOOLS.map((t) => t.function.name));
+
+/** Some models emit `{"name": ..., "arguments": {...}}` as plain text instead of a real tool_calls entry; recover those. */
+function extractFakeToolCalls(content: string): { id: string; type: 'function'; function: { name: string; arguments: string } }[] {
+  const calls: { id: string; type: 'function'; function: { name: string; arguments: string } }[] = [];
+  const marker = /\{\s*"name"\s*:\s*"/g;
+  let match: RegExpExecArray | null;
+
+  while ((match = marker.exec(content))) {
+    const start = match.index;
+    let depth = 0;
+    let end = -1;
+    for (let i = start; i < content.length; i++) {
+      if (content[i] === '{') {
+        depth++;
+      } else if (content[i] === '}') {
+        depth--;
+        if (depth === 0) {
+          end = i;
+          break;
+        }
+      }
+    }
+    if (end === -1) {
+      break;
+    }
+    marker.lastIndex = end + 1;
+
+    try {
+      const parsed = JSON.parse(content.slice(start, end + 1));
+      if (parsed && typeof parsed.name === 'string' && TOOL_NAMES.has(parsed.name) && parsed.arguments) {
+        calls.push({
+          id: `fallback-${calls.length}`,
+          type: 'function',
+          function: { name: parsed.name, arguments: JSON.stringify(parsed.arguments) },
+        });
+      }
+    } catch {
+      // Not a complete/valid JSON object — skip it.
+    }
+  }
+
+  return calls;
+}
+
 export function activate(context: vscode.ExtensionContext) {
   const handler: vscode.ChatRequestHandler = async (request, chatContext, stream, token) => {
     const config = vscode.workspace.getConfiguration('localAgent');
@@ -328,6 +457,7 @@ export function activate(context: vscode.ExtensionContext) {
     const baseUrl = config.get<string>('baseUrl')!;
     const maxTurns = config.get<number>('maxTurns')!;
     const streaming = config.get<boolean>('streaming')!;
+    const numCtx = config.get<number>('numCtx')!;
 
     const messages: OllamaMessage[] = [
       {
@@ -337,12 +467,15 @@ export function activate(context: vscode.ExtensionContext) {
           'If the user message includes an "Attached context" block, that already contains the ' +
           'full contents of the file(s) they mean — read and answer from it directly, do not call ' +
           'a tool to re-read a file that is already attached. ' +
-          'Use read_file, list_directory, and search_workspace to inspect the workspace, and ' +
-          'write_file to create or modify files, instead of shelling out with cat/sed/Get-Content. ' +
-          'Only use run_terminal_command for actions the other tools cannot do (e.g. running tests ' +
-          'or builds). Prefer read-only actions unless the user has explicitly asked you to change something. ' +
-          'When the user asks you to create, edit, update, or fix a file, you MUST call write_file with the ' +
-          'complete new file content in the same turn you decide on the change — never respond with only a ' +
+          'Use read_file, list_directory, and search_workspace to inspect the workspace, instead of ' +
+          'shelling out with cat/sed/Get-Content. For any change to an EXISTING file, always use ' +
+          'edit_file with the exact old_string to replace — never use write_file on a file that ' +
+          'already exists, since regenerating a whole file risks dropping content you did not mean ' +
+          'to touch. Only use write_file to create a file that does not exist yet. Only use ' +
+          'run_terminal_command for actions the other tools cannot do (e.g. running tests or builds). ' +
+          'Prefer read-only actions unless the user has explicitly asked you to change something. ' +
+          'When the user asks you to create, edit, update, or fix something, you MUST call the ' +
+          'appropriate tool in the same turn you decide on the change — never respond with only a ' +
           'prose description or plan of the edit instead of calling the tool.',
       },
     ];
@@ -388,8 +521,8 @@ export function activate(context: vscode.ExtensionContext) {
       let msg;
       try {
         msg = streaming
-          ? await callOllamaStream(baseUrl, model, messages, (delta) => stream.markdown(delta), abortController.signal)
-          : await callOllama(baseUrl, model, messages);
+          ? await callOllamaStream(baseUrl, model, messages, numCtx, (delta) => stream.markdown(delta), abortController.signal)
+          : await callOllama(baseUrl, model, messages, numCtx);
       } catch (err: any) {
         if (abortController.signal.aborted) {
           return;
@@ -399,6 +532,15 @@ export function activate(context: vscode.ExtensionContext) {
             '```\n' + err.message + '\n```'
         );
         return;
+      }
+
+      // Recover tool calls the model wrote as plain-text JSON instead of using the real tool_calls field.
+      if ((!msg.tool_calls || msg.tool_calls.length === 0) && msg.content) {
+        const recovered = extractFakeToolCalls(msg.content);
+        if (recovered.length) {
+          stream.progress('Model described a tool call as text instead of calling it — recovering and running it…');
+          msg.tool_calls = recovered;
+        }
       }
 
       messages.push(msg);
@@ -439,7 +581,15 @@ export function activate(context: vscode.ExtensionContext) {
             break;
           case 'write_file':
             stream.progress(`Writing ${args.path}…`);
-            result = await writeFileTool(args.path, args.content).catch((err: any) => `Error: ${err.message}`);
+            result = await writeFileTool(args.path, args.content, !!args.overwrite).catch(
+              (err: any) => `Error: ${err.message}`
+            );
+            break;
+          case 'edit_file':
+            stream.progress(`Editing ${args.path}…`);
+            result = await editFileTool(args.path, args.old_string, args.new_string).catch(
+              (err: any) => `Error: ${err.message}`
+            );
             break;
           case 'list_directory':
             stream.progress(`Listing ${args.path}…`);
