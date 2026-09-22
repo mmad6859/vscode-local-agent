@@ -51,6 +51,21 @@
           "type": "number",
           "default": 8192,
           "description": "Context window size (in tokens) requested from Ollama. Larger workspaces/files need a bigger value or the model will silently truncate context and may write back incomplete files."
+        },
+        "localAgent.headroomEnabled": {
+          "type": "boolean",
+          "default": false,
+          "description": "Compress conversation context and large tool outputs via a local Headroom proxy before sending them to Ollama. Requires a separately running proxy (see heardoom_server/README.md) — safely no-ops if it isn't reachable."
+        },
+        "localAgent.headroomBaseUrl": {
+          "type": "string",
+          "default": "http://localhost:8787",
+          "description": "Base URL of the local Headroom compression proxy (only used when localAgent.headroomEnabled is true)."
+        },
+        "localAgent.headroomMinCharsToCompress": {
+          "type": "number",
+          "default": 1000,
+          "description": "Minimum character length a tool result must reach before it's routed through Headroom's SharedContext for compression."
         }
       }
     }
@@ -60,6 +75,9 @@
     "compile": "tsc -p ./",
     "watch": "tsc -watch -p ./",
     "package": "vsce package --allow-missing-repository"
+  },
+  "dependencies": {
+    "headroom-ai": "^0.1.0"
   },
   "devDependencies": {
     "@types/node": "^20.19.43",

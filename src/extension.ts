@@ -1,6 +1,7 @@
 import * as vscode from 'vscode';
 import { exec } from 'node:child_process';
 import { promisify } from 'node:util';
+import { compress } from 'headroom-ai';
 
 const execAsync = promisify(exec);
 
@@ -106,15 +107,30 @@ const TOOLS = [
   },
 ];
 
+/** Only offered to the model when Headroom compression is enabled, since it depends on that feature's cache. */
+const HEADROOM_RETRIEVE_TOOL = {
+  type: 'function',
+  function: {
+    name: 'headroom_retrieve',
+    description:
+      'Retrieve the full original content of a tool result that Headroom compressed earlier in this turn.',
+    parameters: {
+      type: 'object',
+      properties: { key: { type: 'string' } },
+      required: ['key'],
+    },
+  },
+};
+
 /**
  * Non-streaming call to Ollama's OpenAI-compatible endpoint. More verbose in the UI than
  * streaming, but some models/Ollama versions only return tool_calls reliably when stream:false.
  */
-async function callOllama(baseUrl: string, model: string, messages: OllamaMessage[], numCtx: number): Promise<OllamaMessage & { tool_calls?: any[] }> {
+async function callOllama(baseUrl: string, model: string, messages: OllamaMessage[], numCtx: number, tools: any[]): Promise<OllamaMessage & { tool_calls?: any[] }> {
   const res = await fetch(baseUrl, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ model, messages, tools: TOOLS, stream: false, options: { num_ctx: numCtx } }),
+    body: JSON.stringify({ model, messages, tools, stream: false, options: { num_ctx: numCtx } }),
   });
 
   if (!res.ok) {
@@ -131,13 +147,14 @@ async function callOllamaStream(
   model: string,
   messages: OllamaMessage[],
   numCtx: number,
+  tools: any[],
   onDelta: (text: string) => void,
   signal: AbortSignal
 ): Promise<OllamaMessage & { tool_calls?: any[] }> {
   const res = await fetch(baseUrl, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ model, messages, tools: TOOLS, stream: true, options: { num_ctx: numCtx } }),
+    body: JSON.stringify({ model, messages, tools, stream: true, options: { num_ctx: numCtx } }),
     signal,
   });
 
@@ -404,7 +421,7 @@ async function searchWorkspaceTool(query: string, isRegex: boolean): Promise<str
   return hits.length ? hits.join('\n') : 'No matches.';
 }
 
-const TOOL_NAMES = new Set(TOOLS.map((t) => t.function.name));
+const TOOL_NAMES = new Set([...TOOLS, HEADROOM_RETRIEVE_TOOL].map((t) => t.function.name));
 
 /** Some models emit `{"name": ..., "arguments": {...}}` as plain text instead of a real tool_calls entry; recover those. */
 function extractFakeToolCalls(content: string): { id: string; type: 'function'; function: { name: string; arguments: string } }[] {
@@ -449,6 +466,80 @@ function extractFakeToolCalls(content: string): { id: string; type: 'function'; 
   return calls;
 }
 
+// Probed once per extension-host session so an unreachable proxy only warns the user a single time.
+let headroomProxyChecked = false;
+
+async function checkHeadroomProxy(baseUrl: string): Promise<boolean> {
+  try {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 1500);
+    const res = await fetch(`${baseUrl}/livez`, { signal: controller.signal });
+    clearTimeout(timeout);
+    return res.ok;
+  } catch {
+    return false;
+  }
+}
+
+/** Compresses the running conversation via the local Headroom proxy; no-ops (returns messages unchanged) if it's unreachable. */
+async function compressWithHeadroom(
+  messages: OllamaMessage[],
+  baseUrl: string,
+  stream: vscode.ChatResponseStream
+): Promise<OllamaMessage[]> {
+  if (!headroomProxyChecked) {
+    headroomProxyChecked = true;
+    if (!(await checkHeadroomProxy(baseUrl))) {
+      stream.markdown(
+        `⚠️ \`localAgent.headroomEnabled\` is on but the Headroom proxy at \`${baseUrl}\` isn't reachable — ` +
+          'continuing without compression. See heardoom_server/README.md to start it.\n\n'
+      );
+    }
+  }
+
+  try {
+    const result = await compress(messages, { baseUrl, fallback: true });
+    if (result.compressed && result.tokensSaved > 0) {
+      stream.progress(`Headroom compressed context: ${result.tokensBefore} → ${result.tokensAfter} tokens (saved ${result.tokensSaved}).`);
+    }
+    return result.messages as OllamaMessage[];
+  } catch {
+    return messages;
+  }
+}
+
+/**
+ * Compresses a single large tool result via Headroom and remembers the original in `memory` so
+ * the model can pull it back later with the headroom_retrieve tool.
+ */
+async function compressToolResult(
+  key: string,
+  result: string,
+  baseUrl: string,
+  minChars: number,
+  memory: Map<string, string>
+): Promise<string> {
+  if (result.length < minChars) {
+    return result;
+  }
+
+  try {
+    const single = await compress([{ role: 'tool', content: result, tool_call_id: 'headroom-cache' }], {
+      baseUrl,
+      fallback: true,
+    });
+    const compressedContent = single.messages[0]?.content;
+    if (typeof compressedContent === 'string' && single.compressed && compressedContent.length < result.length) {
+      memory.set(key, result);
+      return `${compressedContent}\n\n(Compressed by Headroom — call headroom_retrieve with key "${key}" for the full original content.)`;
+    }
+  } catch {
+    // Fall through and return the original, uncompressed result.
+  }
+
+  return result;
+}
+
 export function activate(context: vscode.ExtensionContext) {
   const handler: vscode.ChatRequestHandler = async (request, chatContext, stream, token) => {
     const config = vscode.workspace.getConfiguration('localAgent');
@@ -458,6 +549,12 @@ export function activate(context: vscode.ExtensionContext) {
     const maxTurns = config.get<number>('maxTurns')!;
     const streaming = config.get<boolean>('streaming')!;
     const numCtx = config.get<number>('numCtx')!;
+    const headroomEnabled = config.get<boolean>('headroomEnabled')!;
+    const headroomBaseUrl = config.get<string>('headroomBaseUrl')!;
+    const headroomMinChars = config.get<number>('headroomMinCharsToCompress')!;
+    const toolsForRequest = headroomEnabled ? [...TOOLS, HEADROOM_RETRIEVE_TOOL] : TOOLS;
+    // Full originals of tool results Headroom compressed this request; headroom_retrieve reads from here.
+    const headroomMemory = new Map<string, string>();
 
     const messages: OllamaMessage[] = [
       {
@@ -476,7 +573,11 @@ export function activate(context: vscode.ExtensionContext) {
           'Prefer read-only actions unless the user has explicitly asked you to change something. ' +
           'When the user asks you to create, edit, update, or fix something, you MUST call the ' +
           'appropriate tool in the same turn you decide on the change — never respond with only a ' +
-          'prose description or plan of the edit instead of calling the tool.',
+          'prose description or plan of the edit instead of calling the tool.' +
+          (headroomEnabled
+            ? ' Large tool outputs may come back compressed with a note like "call headroom_retrieve ' +
+              'with key ..." — use that tool if you need the full original content.'
+            : ''),
       },
     ];
 
@@ -518,11 +619,15 @@ export function activate(context: vscode.ExtensionContext) {
 
       stream.progress(turn === 0 ? 'Thinking…' : 'Continuing…');
 
+      const messagesToSend = headroomEnabled
+        ? await compressWithHeadroom(messages, headroomBaseUrl, stream)
+        : messages;
+
       let msg;
       try {
         msg = streaming
-          ? await callOllamaStream(baseUrl, model, messages, numCtx, (delta) => stream.markdown(delta), abortController.signal)
-          : await callOllama(baseUrl, model, messages, numCtx);
+          ? await callOllamaStream(baseUrl, model, messagesToSend, numCtx, toolsForRequest, (delta) => stream.markdown(delta), abortController.signal)
+          : await callOllama(baseUrl, model, messagesToSend, numCtx, toolsForRequest);
       } catch (err: any) {
         if (abortController.signal.aborted) {
           return;
@@ -572,12 +677,18 @@ export function activate(context: vscode.ExtensionContext) {
             } else {
               stream.progress(`Running: ${args.command}`);
               result = await runToolCall(args.command);
+              if (headroomEnabled) {
+                result = await compressToolResult(`run_terminal_command:${args.command}`, result, headroomBaseUrl, headroomMinChars, headroomMemory);
+              }
             }
             break;
           }
           case 'read_file':
             stream.progress(`Reading ${args.path}…`);
             result = await readFileTool(args.path).catch((err: any) => `Error: ${err.message}`);
+            if (headroomEnabled) {
+              result = await compressToolResult(`read_file:${args.path}`, result, headroomBaseUrl, headroomMinChars, headroomMemory);
+            }
             break;
           case 'write_file':
             stream.progress(`Writing ${args.path}…`);
@@ -598,7 +709,15 @@ export function activate(context: vscode.ExtensionContext) {
           case 'search_workspace':
             stream.progress(`Searching for "${args.query}"…`);
             result = await searchWorkspaceTool(args.query, !!args.isRegex).catch((err: any) => `Error: ${err.message}`);
+            if (headroomEnabled) {
+              result = await compressToolResult(`search_workspace:${args.query}`, result, headroomBaseUrl, headroomMinChars, headroomMemory);
+            }
             break;
+          case 'headroom_retrieve': {
+            const original = headroomMemory.get(args.key);
+            result = original !== undefined ? original : `Error: no cached content found for key "${args.key}".`;
+            break;
+          }
           default:
             result = `Unknown tool: ${call.function.name}`;
         }
