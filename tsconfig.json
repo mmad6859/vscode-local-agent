@@ -7,8 +7,10 @@
     "rootDir": "src",
     "sourceMap": true,
     "strict": true,
+    "moduleResolution": "node",
     "esModuleInterop": true,
     "skipLibCheck": true
   },
-  "exclude": ["node_modules", ".vscode-test", "out"]
+  "exclude": ["node_modules", ".vscode-test"]
 }
+

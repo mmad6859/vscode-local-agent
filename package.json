@@ -2,7 +2,7 @@
   "name": "local-harness-agent",
   "displayName": "Local Harness Agent",
   "description": "A local, Ollama-backed coding agent exposed as a VS Code chat participant (@localagent).",
-  "version": "0.0.6",
+  "version": "0.0.7",
   "publisher": "mahesha-madhushanka",
   "engines": {
     "vscode": "^1.95.0"
@@ -66,6 +66,16 @@
           "type": "number",
           "default": 1000,
           "description": "Minimum character length a tool result must reach before it's routed through Headroom's SharedContext for compression."
+        },
+        "localAgent.subagentsEnabled": {
+          "type": "boolean",
+          "default": false,
+          "description": "Let the agent delegate self-contained subtasks to a spawn_subagent tool, which runs its own nested tool-calling loop and returns only its final answer. Off by default — enable once you trust the base agent's tool use, since a subagent's file writes still require your approval but run with less visibility into what it's doing along the way."
+        },
+        "localAgent.subagentMaxTurns": {
+          "type": "number",
+          "default": 10,
+          "description": "Max tool-calling round-trips a single subagent gets before it's forced to give its best answer. Kept lower than localAgent.maxTurns since a subagent should be handling one focused subtask, not an open-ended one."
         }
       }
     }
